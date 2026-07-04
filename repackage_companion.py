@@ -3,9 +3,11 @@
 repackage_companion.py
 - Auto-detects package name from companion.apk via aapt
 - Generates a random new package name
-- Decodes with resource bypass (-r flag) — avoids aapt rebuild errors
-- Replaces package name only in manifest + smali (text files only)
-- Rebuilds, aligns, signs, verifies
+- Decode with -r (skip resource decode, avoid res dir errors)
+- Rebuild WITHOUT -r (re-encodes manifest to binary — required by apksigner)
+- Adds --min-sdk-version 28 to apksigner as hard fallback
+- Re-signs with auto-generated keystore
+- Outputs installable APK
 """
 
 import os
@@ -24,13 +26,13 @@ KS_ALIAS   = "companion_key"
 KS_PASS    = "companion1234"
 KEY_PASS   = "companion1234"
 ERROR_LOG  = "build_error.log"
+MIN_SDK    = "28"
 
 WORK_DIR    = "/tmp/companion_repackage"
 DECODED_DIR = os.path.join(WORK_DIR, "decoded")
 REBUILT_APK = os.path.join(WORK_DIR, "rebuilt.apk")
 ALIGNED_APK = os.path.join(WORK_DIR, "aligned.apk")
 
-# Only touch these file types — never binary assets
 TEXT_EXTENSIONS = {".smali", ".xml", ".yml", ".yaml", ".txt", ".json", ".mf", ".sf"}
 
 
@@ -83,15 +85,13 @@ def generate_keystore():
 
 def decode():
     """
-    Decode with -r (skip resource decode) to avoid aapt rebuild issues
-    with non-standard resource directory names in the companion APK.
-    Manifest is decoded to plain XML. Smali is decoded normally.
-    Resources stay as-is from the original APK — not touched.
+    -r skips resource decoding — avoids aapt failing on non-standard res dir names.
+    Manifest is still decoded to plain XML by apktool at this stage.
     """
     if os.path.exists(DECODED_DIR):
         shutil.rmtree(DECODED_DIR)
     run(["apktool", "d", INPUT_APK, "-o", DECODED_DIR, "-r", "-f"])
-    print("[OK] Decoded — resources kept raw, manifest decoded to plain XML")
+    print("[OK] Decoded — resources skipped, manifest decoded to plain XML")
 
 
 def replace_package(old_pkg, new_pkg):
@@ -103,7 +103,6 @@ def replace_package(old_pkg, new_pkg):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext not in TEXT_EXTENSIONS:
-                # Skip all binary files — .png, .dex, .so, .arsc, etc.
                 continue
             fpath = os.path.join(root, fname)
             try:
@@ -118,13 +117,17 @@ def replace_package(old_pkg, new_pkg):
             except Exception as e:
                 print(f"[SKIP] {fpath} — {e}")
 
-    print(f"[OK] Package replaced in {count} text files")
+    print(f"[OK] Package replaced in {count} files")
 
 
 def rebuild():
-    """Rebuild without resource recompilation (-r) — matches how we decoded."""
-    run(["apktool", "b", DECODED_DIR, "-o", REBUILT_APK, "-r"])
-    print("[OK] Rebuilt")
+    """
+    No -r here — apktool re-encodes AndroidManifest.xml back to binary XML.
+    Binary manifest is required by apksigner to read minSdkVersion.
+    Resources are carried through from the original APK unchanged.
+    """
+    run(["apktool", "b", DECODED_DIR, "-o", REBUILT_APK])
+    print("[OK] Rebuilt — manifest re-encoded to binary XML")
 
 
 def align():
@@ -139,6 +142,7 @@ def sign():
         "--ks-key-alias", KS_ALIAS,
         "--ks-pass", f"pass:{KS_PASS}",
         "--key-pass", f"pass:{KEY_PASS}",
+        "--min-sdk-version", MIN_SDK,
         "--out", OUTPUT_APK,
         ALIGNED_APK
     ])
