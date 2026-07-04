@@ -3,6 +3,7 @@
 repackage_companion.py
 - Auto-detects current package name from companion.apk
 - Generates a random new package name
+- Full decode (binary manifest → plain XML) via apktool
 - Re-signs with auto-generated keystore
 - Outputs installable APK
 """
@@ -78,20 +79,42 @@ def generate_keystore():
 
 
 def decode():
+    """Full decode — no --no-res flag. apktool converts binary manifest to plain XML."""
     if os.path.exists(DECODED_DIR):
         shutil.rmtree(DECODED_DIR)
-    run(["apktool", "d", INPUT_APK, "-o", DECODED_DIR, "--no-res", "-f"])
-    print("[OK] Decoded")
+    run(["apktool", "d", INPUT_APK, "-o", DECODED_DIR, "-f"])
+    print("[OK] Decoded — manifest is plain XML")
 
 
 def replace_package(old_pkg, new_pkg):
     old_path = old_pkg.replace(".", "/")
     new_path = new_pkg.replace(".", "/")
 
-    # All files — read/write as raw bytes, no encoding issues
+    # Manifest is now plain UTF-8 XML — safe to read as text
+    manifest = os.path.join(DECODED_DIR, "AndroidManifest.xml")
+    with open(manifest, "r", encoding="utf-8") as f:
+        content = f.read()
+    content = content.replace(old_pkg, new_pkg)
+    with open(manifest, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"[OK] Manifest: {old_pkg} → {new_pkg}")
+
+    # apktool.yml — update package name here too
+    yml = os.path.join(DECODED_DIR, "apktool.yml")
+    if os.path.exists(yml):
+        with open(yml, "r", encoding="utf-8") as f:
+            content = f.read()
+        content = content.replace(old_pkg, new_pkg)
+        with open(yml, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"[OK] apktool.yml updated")
+
+    # Smali files — raw bytes to avoid encoding issues
     count = 0
     for root, _, files in os.walk(DECODED_DIR):
         for fname in files:
+            if not fname.endswith(".smali"):
+                continue
             fpath = os.path.join(root, fname)
             with open(fpath, "rb") as f:
                 raw = f.read()
@@ -101,7 +124,7 @@ def replace_package(old_pkg, new_pkg):
                 with open(fpath, "wb") as f:
                     f.write(raw)
                 count += 1
-    print(f"[OK] Package replaced in {count} files")
+    print(f"[OK] Smali updated: {count} files")
 
 
 def rebuild():
