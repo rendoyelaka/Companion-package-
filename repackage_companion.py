@@ -88,19 +88,10 @@ def replace_package(old_pkg, new_pkg):
     old_path = old_pkg.replace(".", "/")
     new_path = new_pkg.replace(".", "/")
 
-    manifest = os.path.join(DECODED_DIR, "AndroidManifest.xml")
-    with open(manifest, "r", encoding="utf-8") as f:
-        content = f.read()
-    content = content.replace(old_pkg, new_pkg)
-    with open(manifest, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"[OK] Manifest updated")
-
+    # All files — read/write as raw bytes, no encoding issues
     count = 0
     for root, _, files in os.walk(DECODED_DIR):
         for fname in files:
-            if not fname.endswith(".smali"):
-                continue
             fpath = os.path.join(root, fname)
             with open(fpath, "rb") as f:
                 raw = f.read()
@@ -110,7 +101,7 @@ def replace_package(old_pkg, new_pkg):
                 with open(fpath, "wb") as f:
                     f.write(raw)
                 count += 1
-    print(f"[OK] Smali updated: {count} files")
+    print(f"[OK] Package replaced in {count} files")
 
 
 def rebuild():
