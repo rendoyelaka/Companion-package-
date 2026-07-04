@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
 repackage_companion.py
-Purpose : Change companion APK package name, auto-sign, output installable APK.
-Usage   : python3 repackage_companion.py
-Requires: apktool, zipalign, apksigner, default-jdk
+- Auto-detects current package name from companion.apk
+- Generates a random new package name
+- Re-signs with auto-generated keystore
+- Outputs installable APK
 """
 
 import os
 import sys
 import shutil
+import random
+import string
 import subprocess
 import traceback
+import re
 
-# ─── CONFIG — edit these two lines only ───────────────────────────────────────
-OLD_PKG   = "com.original.companion.package"   # current package name in APK
-NEW_PKG   = "com.your.new.package.name"        # desired new package name
-INPUT_APK = "companion.apk"                   # place companion.apk next to this script
-# ──────────────────────────────────────────────────────────────────────────────
-
-OUTPUT_APK  = "companion_repackaged.apk"
-KEYSTORE    = "test_companion.jks"
-KS_ALIAS    = "companion_key"
-KS_PASS     = "companion1234"
-KEY_PASS    = "companion1234"
-ERROR_LOG   = "build_error.log"
+INPUT_APK  = "companion.apk"
+OUTPUT_APK = "companion_repackaged.apk"
+KEYSTORE   = "test_companion.jks"
+KS_ALIAS   = "companion_key"
+KS_PASS    = "companion1234"
+KEY_PASS   = "companion1234"
+ERROR_LOG  = "build_error.log"
 
 WORK_DIR    = "/tmp/companion_repackage"
 DECODED_DIR = os.path.join(WORK_DIR, "decoded")
@@ -40,6 +39,23 @@ def run(cmd, check=True):
     if check and result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
     return result
+
+
+def detect_package():
+    result = run(["aapt", "dump", "badging", INPUT_APK], check=True)
+    match = re.search(r"package: name='([^']+)'", result.stdout)
+    if not match:
+        raise RuntimeError("Could not detect package name from APK")
+    pkg = match.group(1)
+    print(f"[OK] Detected package: {pkg}")
+    return pkg
+
+
+def random_package():
+    def seg(n): return ''.join(random.choices(string.ascii_lowercase, k=n))
+    pkg = f"com.{seg(6)}.{seg(5)}.{seg(7)}"
+    print(f"[OK] New package: {pkg}")
+    return pkg
 
 
 def generate_keystore():
@@ -68,20 +84,18 @@ def decode():
     print("[OK] Decoded")
 
 
-def replace_package():
-    old_path = OLD_PKG.replace(".", "/")
-    new_path = NEW_PKG.replace(".", "/")
+def replace_package(old_pkg, new_pkg):
+    old_path = old_pkg.replace(".", "/")
+    new_path = new_pkg.replace(".", "/")
 
-    # Manifest — pure text, safe UTF-8
     manifest = os.path.join(DECODED_DIR, "AndroidManifest.xml")
     with open(manifest, "r", encoding="utf-8") as f:
         content = f.read()
-    content = content.replace(OLD_PKG, NEW_PKG)
+    content = content.replace(old_pkg, new_pkg)
     with open(manifest, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"[OK] Manifest: {OLD_PKG} → {NEW_PKG}")
+    print(f"[OK] Manifest updated")
 
-    # Smali — read/write as raw bytes to avoid encoding errors
     count = 0
     for root, _, files in os.walk(DECODED_DIR):
         for fname in files:
@@ -90,9 +104,9 @@ def replace_package():
             fpath = os.path.join(root, fname)
             with open(fpath, "rb") as f:
                 raw = f.read()
-            if old_path.encode() in raw or OLD_PKG.encode() in raw:
+            if old_path.encode() in raw or old_pkg.encode() in raw:
                 raw = raw.replace(old_path.encode(), new_path.encode())
-                raw = raw.replace(OLD_PKG.encode(), NEW_PKG.encode())
+                raw = raw.replace(old_pkg.encode(), new_pkg.encode())
                 with open(fpath, "wb") as f:
                     f.write(raw)
                 count += 1
@@ -141,31 +155,38 @@ if __name__ == "__main__":
         print("\n=== Step 1: Keystore ===")
         generate_keystore()
 
-        print("\n=== Step 2: Decode ===")
+        print("\n=== Step 2: Detect Package Name ===")
+        old_pkg = detect_package()
+
+        print("\n=== Step 3: Generate New Package Name ===")
+        new_pkg = random_package()
+
+        print("\n=== Step 4: Decode ===")
         decode()
 
-        print("\n=== Step 3: Replace Package Name ===")
-        replace_package()
+        print("\n=== Step 5: Replace Package Name ===")
+        replace_package(old_pkg, new_pkg)
 
-        print("\n=== Step 4: Rebuild ===")
+        print("\n=== Step 6: Rebuild ===")
         rebuild()
 
-        print("\n=== Step 5: Align ===")
+        print("\n=== Step 7: Align ===")
         align()
 
-        print("\n=== Step 6: Sign ===")
+        print("\n=== Step 8: Sign ===")
         sign()
 
-        print("\n=== Step 7: Verify ===")
+        print("\n=== Step 9: Verify ===")
         verify()
 
         cleanup()
-        print(f"\n[DONE] Install this APK to test: {OUTPUT_APK}")
+        print(f"\n[DONE] Package: {old_pkg} → {new_pkg}")
+        print(f"[DONE] Install: {OUTPUT_APK}")
 
     except Exception as e:
         error_msg = traceback.format_exc()
         print(f"\n[ERROR] {e}")
         with open(ERROR_LOG, "w") as f:
             f.write(error_msg)
-        print(f"[LOG] Error saved to: {ERROR_LOG}")
+        print(f"[LOG] Error saved: {ERROR_LOG}")
         sys.exit(1)
