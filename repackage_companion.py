@@ -10,11 +10,12 @@ import os
 import sys
 import shutil
 import subprocess
+import traceback
 
 # ─── CONFIG — edit these two lines only ───────────────────────────────────────
-OLD_PKG  = "com.original.companion.package"       # current package name in APK
-NEW_PKG  = "com.your.new.package.name"            # desired new package name
-INPUT_APK = "companion.apk"                       # place companion.apk next to this script
+OLD_PKG   = "com.original.companion.package"   # current package name in APK
+NEW_PKG   = "com.your.new.package.name"        # desired new package name
+INPUT_APK = "companion.apk"                   # place companion.apk next to this script
 # ──────────────────────────────────────────────────────────────────────────────
 
 OUTPUT_APK  = "companion_repackaged.apk"
@@ -22,6 +23,7 @@ KEYSTORE    = "test_companion.jks"
 KS_ALIAS    = "companion_key"
 KS_PASS     = "companion1234"
 KEY_PASS    = "companion1234"
+ERROR_LOG   = "build_error.log"
 
 WORK_DIR    = "/tmp/companion_repackage"
 DECODED_DIR = os.path.join(WORK_DIR, "decoded")
@@ -36,8 +38,7 @@ def run(cmd, check=True):
     if result.stderr.strip():
         print(result.stderr.strip())
     if check and result.returncode != 0:
-        print(f"[FAIL] {' '.join(cmd)}")
-        sys.exit(1)
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
     return result
 
 
@@ -71,27 +72,29 @@ def replace_package():
     old_path = OLD_PKG.replace(".", "/")
     new_path = NEW_PKG.replace(".", "/")
 
+    # Manifest — pure text, safe UTF-8
     manifest = os.path.join(DECODED_DIR, "AndroidManifest.xml")
-    with open(manifest, "r") as f:
+    with open(manifest, "r", encoding="utf-8") as f:
         content = f.read()
     content = content.replace(OLD_PKG, NEW_PKG)
-    with open(manifest, "w") as f:
+    with open(manifest, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"[OK] Manifest: {OLD_PKG} → {NEW_PKG}")
 
+    # Smali — read/write as raw bytes to avoid encoding errors
     count = 0
     for root, _, files in os.walk(DECODED_DIR):
         for fname in files:
             if not fname.endswith(".smali"):
                 continue
             fpath = os.path.join(root, fname)
-            with open(fpath, "r", errors="ignore") as f:
-                content = f.read()
-            if old_path in content or OLD_PKG in content:
-                content = content.replace(old_path, new_path)
-                content = content.replace(OLD_PKG, NEW_PKG)
-                with open(fpath, "w") as f:
-                    f.write(content)
+            with open(fpath, "rb") as f:
+                raw = f.read()
+            if old_path.encode() in raw or OLD_PKG.encode() in raw:
+                raw = raw.replace(old_path.encode(), new_path.encode())
+                raw = raw.replace(OLD_PKG.encode(), NEW_PKG.encode())
+                with open(fpath, "wb") as f:
+                    f.write(raw)
                 count += 1
     print(f"[OK] Smali updated: {count} files")
 
@@ -132,28 +135,37 @@ def cleanup():
 
 
 if __name__ == "__main__":
-    os.makedirs(WORK_DIR, exist_ok=True)
+    try:
+        os.makedirs(WORK_DIR, exist_ok=True)
 
-    print("\n=== Step 1: Keystore ===")
-    generate_keystore()
+        print("\n=== Step 1: Keystore ===")
+        generate_keystore()
 
-    print("\n=== Step 2: Decode ===")
-    decode()
+        print("\n=== Step 2: Decode ===")
+        decode()
 
-    print("\n=== Step 3: Replace Package Name ===")
-    replace_package()
+        print("\n=== Step 3: Replace Package Name ===")
+        replace_package()
 
-    print("\n=== Step 4: Rebuild ===")
-    rebuild()
+        print("\n=== Step 4: Rebuild ===")
+        rebuild()
 
-    print("\n=== Step 5: Align ===")
-    align()
+        print("\n=== Step 5: Align ===")
+        align()
 
-    print("\n=== Step 6: Sign ===")
-    sign()
+        print("\n=== Step 6: Sign ===")
+        sign()
 
-    print("\n=== Step 7: Verify ===")
-    verify()
+        print("\n=== Step 7: Verify ===")
+        verify()
 
-    cleanup()
-    print(f"\n[DONE] Install this APK to test: {OUTPUT_APK}")
+        cleanup()
+        print(f"\n[DONE] Install this APK to test: {OUTPUT_APK}")
+
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        print(f"\n[ERROR] {e}")
+        with open(ERROR_LOG, "w") as f:
+            f.write(error_msg)
+        print(f"[LOG] Error saved to: {ERROR_LOG}")
+        sys.exit(1)
