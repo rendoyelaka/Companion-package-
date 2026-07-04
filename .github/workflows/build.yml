@@ -1,14 +1,9 @@
 name: Repackage Companion APK
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
-    inputs:
-      old_pkg:
-        description: 'Current package name in companion APK'
-        required: true
-      new_pkg:
-        description: 'New package name'
-        required: true
 
 jobs:
   repackage:
@@ -22,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y apktool zipalign apksigner default-jdk
+          sudo apt-get install -y apktool zipalign apksigner default-jdk aapt
 
       - name: Verify companion.apk exists
         run: |
@@ -33,10 +28,7 @@ jobs:
           echo "[OK] companion.apk found ($(du -h companion.apk | cut -f1))"
 
       - name: Run repackage script
-        run: |
-          sed -i "s|OLD_PKG   = .*|OLD_PKG   = \"${{ github.event.inputs.old_pkg }}\"|" repackage_companion.py
-          sed -i "s|NEW_PKG   = .*|NEW_PKG   = \"${{ github.event.inputs.new_pkg }}\"|" repackage_companion.py
-          python3 repackage_companion.py
+        run: python3 repackage_companion.py
 
       - name: Upload repackaged APK
         if: success()
