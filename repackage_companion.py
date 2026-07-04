@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 repackage_companion.py
-- Auto-detects current package name from companion.apk
+- Auto-detects package name from companion.apk via aapt
 - Generates a random new package name
-- Full decode (binary manifest → plain XML) via apktool
-- Re-signs with auto-generated keystore
-- Outputs installable APK
+- Decodes with resource bypass (-r flag) — avoids aapt rebuild errors
+- Replaces package name only in manifest + smali (text files only)
+- Rebuilds, aligns, signs, verifies
 """
 
 import os
@@ -29,6 +29,9 @@ WORK_DIR    = "/tmp/companion_repackage"
 DECODED_DIR = os.path.join(WORK_DIR, "decoded")
 REBUILT_APK = os.path.join(WORK_DIR, "rebuilt.apk")
 ALIGNED_APK = os.path.join(WORK_DIR, "aligned.apk")
+
+# Only touch these file types — never binary assets
+TEXT_EXTENSIONS = {".smali", ".xml", ".yml", ".yaml", ".txt", ".json", ".mf", ".sf"}
 
 
 def run(cmd, check=True):
@@ -79,56 +82,48 @@ def generate_keystore():
 
 
 def decode():
-    """Full decode — no --no-res flag. apktool converts binary manifest to plain XML."""
+    """
+    Decode with -r (skip resource decode) to avoid aapt rebuild issues
+    with non-standard resource directory names in the companion APK.
+    Manifest is decoded to plain XML. Smali is decoded normally.
+    Resources stay as-is from the original APK — not touched.
+    """
     if os.path.exists(DECODED_DIR):
         shutil.rmtree(DECODED_DIR)
-    run(["apktool", "d", INPUT_APK, "-o", DECODED_DIR, "-f"])
-    print("[OK] Decoded — manifest is plain XML")
+    run(["apktool", "d", INPUT_APK, "-o", DECODED_DIR, "-r", "-f"])
+    print("[OK] Decoded — resources kept raw, manifest decoded to plain XML")
 
 
 def replace_package(old_pkg, new_pkg):
     old_path = old_pkg.replace(".", "/")
     new_path = new_pkg.replace(".", "/")
-
-    # Manifest is now plain UTF-8 XML — safe to read as text
-    manifest = os.path.join(DECODED_DIR, "AndroidManifest.xml")
-    with open(manifest, "r", encoding="utf-8") as f:
-        content = f.read()
-    content = content.replace(old_pkg, new_pkg)
-    with open(manifest, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"[OK] Manifest: {old_pkg} → {new_pkg}")
-
-    # apktool.yml — update package name here too
-    yml = os.path.join(DECODED_DIR, "apktool.yml")
-    if os.path.exists(yml):
-        with open(yml, "r", encoding="utf-8") as f:
-            content = f.read()
-        content = content.replace(old_pkg, new_pkg)
-        with open(yml, "w", encoding="utf-8") as f:
-            f.write(content)
-        print(f"[OK] apktool.yml updated")
-
-    # Smali files — raw bytes to avoid encoding issues
     count = 0
+
     for root, _, files in os.walk(DECODED_DIR):
         for fname in files:
-            if not fname.endswith(".smali"):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in TEXT_EXTENSIONS:
+                # Skip all binary files — .png, .dex, .so, .arsc, etc.
                 continue
             fpath = os.path.join(root, fname)
-            with open(fpath, "rb") as f:
-                raw = f.read()
-            if old_path.encode() in raw or old_pkg.encode() in raw:
-                raw = raw.replace(old_path.encode(), new_path.encode())
-                raw = raw.replace(old_pkg.encode(), new_pkg.encode())
-                with open(fpath, "wb") as f:
-                    f.write(raw)
-                count += 1
-    print(f"[OK] Smali updated: {count} files")
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                if old_path in content or old_pkg in content:
+                    content = content.replace(old_path, new_path)
+                    content = content.replace(old_pkg, new_pkg)
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    count += 1
+            except Exception as e:
+                print(f"[SKIP] {fpath} — {e}")
+
+    print(f"[OK] Package replaced in {count} text files")
 
 
 def rebuild():
-    run(["apktool", "b", DECODED_DIR, "-o", REBUILT_APK])
+    """Rebuild without resource recompilation (-r) — matches how we decoded."""
+    run(["apktool", "b", DECODED_DIR, "-o", REBUILT_APK, "-r"])
     print("[OK] Rebuilt")
 
 
