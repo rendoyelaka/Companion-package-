@@ -2,27 +2,34 @@
 """
 repackage_companion.py
 
-ROOT CAUSE (fully resolved):
-  Previous builds only patched AndroidManifest.xml.
-  classes.dex still contained 81 occurrences of the old package path:
-    - 73x slash-form: com/android/pictach  (DEX type descriptors)
-    -  8x dot-form:   com.android.pictach  (string literals)
-  Android loads class com.android.pictach.App — finds no such class
-  because the manifest says com.vjmiiau.fteqlji.App. Immediate crash.
+ROOT CAUSE (fully resolved — all three sources):
 
-  Additionally: DEX binary patch requires recomputing:
-    - SHA-1 signature  (bytes 12-31 of DEX header, covers bytes[32:])
-    - Adler32 checksum (bytes 8-11  of DEX header, covers bytes[12:])
-  Without recomputation: dexopt rejects the DEX on load.
+  CRASH SOURCE 1 — AndroidManifest.xml (FIXED in prior build)
+    Binary XML string pool stores package name as UTF-8.
+    Patched via same-length byte replacement. Done.
 
-APPROACH — pure binary patch, no apktool, no recompilation:
+  CRASH SOURCE 2 — classes.dex (FIXED in prior build)
+    DEX type descriptors (slash-form) and string literals (dot-form).
+    Patched + SHA-1 and Adler32 recomputed. Done.
+
+  CRASH SOURCE 3 — resources.arsc (THIS BUILD)
+    RES_TABLE_PACKAGE chunk stores the package name as UTF-16LE
+    at a fixed offset within the resource table binary.
+    Android's resource manager reads this independently of the manifest.
+    Mismatch between arsc package name and manifest package name
+    kills the process before the first activity renders.
+    Old name: com.android.pictach (UTF-16LE, 38 bytes)
+    Location: single occurrence at offset 235296 in resources.arsc.
+    Fix: same-length UTF-16LE binary patch. No recompilation needed.
+
+APPROACH — pure binary patch across all three binary artifacts:
   1. aapt detects old package name
-  2. Same-length random package name generated (critical — binary offsets stay valid)
-  3. AndroidManifest.xml patched in-memory (binary XML string pool)
-  4. classes.dex patched in-memory (slash-form + dot-form)
-  5. DEX SHA-1 + Adler32 recomputed after patch
-  6. APK repacked preserving all compression types
-  7. zipalign + apksigner v2+v3
+  2. Same-length random package name generated (critical for binary offset safety)
+  3. AndroidManifest.xml  — UTF-8 binary patch
+  4. classes.dex          — UTF-8 slash-form + dot-form patch, SHA-1 + Adler32 recomputed
+  5. resources.arsc       — UTF-16LE binary patch (RES_TABLE_PACKAGE name field)
+  6. All other DEX files  — same patch as classes.dex (multi-dex support)
+  7. APK repacked, zipaligned, signed v2+v3
 """
 
 import os
@@ -71,19 +78,22 @@ def detect_package():
 def same_length_random_package(old_pkg):
     """
     New package name MUST be identical byte length to old_pkg.
-    Binary manifest and DEX string pool entries are length-prefixed.
-    Different length = corrupted offsets = parse failure or crash.
+    All three binary artifacts use length-sensitive storage:
+      - Manifest: UTF-8 length-prefixed string pool
+      - DEX:      UTF-8 length-prefixed string pool
+      - ARSC:     UTF-16LE fixed-width name field
+    Different length corrupts chunk offsets in all three.
     """
     target_len = len(old_pkg)
-    seg_total = target_len - 5  # subtract "com" + "." + "."
+    seg_total = target_len - 5  # "com" + "." + "."
     if seg_total < 2:
-        raise RuntimeError(f"Package too short to randomize: {old_pkg}")
+        raise RuntimeError(f"Package too short to randomize safely: {old_pkg}")
     seg1 = seg_total // 2
     seg2 = seg_total - seg1
     def seg(n): return ''.join(random.choices(string.ascii_lowercase, k=n))
     new_pkg = f"com.{seg(seg1)}.{seg(seg2)}"
     assert len(new_pkg) == target_len, f"Length mismatch: {len(new_pkg)} != {target_len}"
-    print(f"[OK] New package: {new_pkg} (len={len(new_pkg)}) — exact length match confirmed")
+    print(f"[OK] New package: {new_pkg} (len={len(new_pkg)}) — exact length confirmed")
     return new_pkg
 
 
@@ -106,33 +116,37 @@ def generate_keystore():
     print(f"[OK] Keystore generated: {KEYSTORE}")
 
 
-def patch_dex(dex_bytes, old_pkg, new_pkg):
+def patch_manifest(data, old_pkg, new_pkg):
+    """UTF-8 binary patch on AndroidManifest.xml binary XML string pool."""
+    old_b = old_pkg.encode('utf-8')
+    new_b = new_pkg.encode('utf-8')
+    assert len(old_b) == len(new_b)
+    count = data.count(old_b)
+    result = data.replace(old_b, new_b)
+    print(f"[OK] Manifest: {count} occurrences patched")
+    return result
+
+
+def patch_dex(data, old_pkg, new_pkg):
     """
-    Patch all package name occurrences in DEX binary.
-    DEX uses two forms:
-      - Slash-form: com/android/pictach  (type descriptors: Lcom/pkg/Class;)
-      - Dot-form:   com.android.pictach  (string literals, BuildConfig, etc.)
-    After patching, recompute:
-      - SHA-1 signature  at bytes[12:32] covering bytes[32:]
-      - Adler32 checksum at bytes[8:12]  covering bytes[12:]
-    Both are validated by Android's dexopt — mismatch = crash on class load.
+    UTF-8 patch on DEX string pool — both slash-form (type descriptors)
+    and dot-form (string literals). Recomputes SHA-1 and Adler32 after patch.
     """
-    dex = bytearray(dex_bytes)
+    dex = bytearray(data)
 
     old_slash = old_pkg.replace('.', '/').encode('utf-8')
     new_slash = new_pkg.replace('.', '/').encode('utf-8')
     old_dot   = old_pkg.encode('utf-8')
     new_dot   = new_pkg.encode('utf-8')
 
-    assert len(old_slash) == len(new_slash), "Slash-form length mismatch"
-    assert len(old_dot)   == len(new_dot),   "Dot-form length mismatch"
+    assert len(old_slash) == len(new_slash)
+    assert len(old_dot)   == len(new_dot)
 
     slash_count = 0
     pos = 0
     while True:
         p = bytes(dex).find(old_slash, pos)
-        if p == -1:
-            break
+        if p == -1: break
         dex[p:p+len(old_slash)] = new_slash
         slash_count += 1
         pos = p + 1
@@ -141,13 +155,10 @@ def patch_dex(dex_bytes, old_pkg, new_pkg):
     pos = 0
     while True:
         p = bytes(dex).find(old_dot, pos)
-        if p == -1:
-            break
+        if p == -1: break
         dex[p:p+len(old_dot)] = new_dot
         dot_count += 1
         pos = p + 1
-
-    print(f"[OK] DEX patched: {slash_count} slash-form + {dot_count} dot-form occurrences")
 
     # Recompute SHA-1: covers bytes[32:]
     sha1 = hashlib.sha1(bytes(dex[32:])).digest()
@@ -157,35 +168,44 @@ def patch_dex(dex_bytes, old_pkg, new_pkg):
     adler = zlib.adler32(bytes(dex[12:])) & 0xFFFFFFFF
     struct.pack_into('<I', dex, 8, adler)
 
-    print(f"[OK] DEX header recomputed — SHA-1: {sha1.hex()[:16]}... Adler32: 0x{adler:08x}")
-
-    # Verify clean
     remaining = bytes(dex).count(old_slash) + bytes(dex).count(old_dot)
     if remaining > 0:
         raise RuntimeError(f"DEX patch incomplete — {remaining} old strings remain")
 
+    print(f"[OK] DEX: {slash_count} slash-form + {dot_count} dot-form patched, checksums recomputed")
     return bytes(dex)
 
 
-def patch_manifest(manifest_bytes, old_pkg, new_pkg):
+def patch_arsc(data, old_pkg, new_pkg):
     """
-    Binary XML string pool patch.
-    Same-length replacement keeps all chunk offset tables valid.
+    UTF-16LE patch on resources.arsc RES_TABLE_PACKAGE name field.
+    Android's resource manager reads this independently of the manifest.
+    Mismatch between arsc package name and manifest = crash before first activity.
+    Same-length constraint: UTF-16LE encodes each char as 2 bytes,
+    so same char-length pkg = same byte-length = safe patch.
     """
-    old_bytes = old_pkg.encode('utf-8')
-    new_bytes = new_pkg.encode('utf-8')
-    assert len(old_bytes) == len(new_bytes), "Manifest patch length mismatch"
+    old_utf16 = old_pkg.encode('utf-16-le')
+    new_utf16 = new_pkg.encode('utf-16-le')
+    assert len(old_utf16) == len(new_utf16), \
+        f"UTF-16LE length mismatch: {len(old_utf16)} != {len(new_utf16)}"
 
-    count = manifest_bytes.count(old_bytes)
-    patched = manifest_bytes.replace(old_bytes, new_bytes)
-    print(f"[OK] Manifest patched: {count} occurrences")
-    return patched
+    count = data.count(old_utf16)
+    if count == 0:
+        print(f"[SKIP] resources.arsc: old package name not found in UTF-16LE — already clean or different encoding")
+        return data
+
+    result = data.replace(old_utf16, new_utf16)
+    print(f"[OK] resources.arsc: {count} UTF-16LE occurrence(s) patched")
+    return result
 
 
 def binary_patch_apk(old_pkg, new_pkg):
     """
-    Repack APK with patched AndroidManifest.xml and classes.dex.
-    All other files carried through byte-for-byte with original compression.
+    Repack APK with all three binary artifacts patched:
+      - AndroidManifest.xml  (UTF-8)
+      - classes.dex + multidex (UTF-8 + checksum recompute)
+      - resources.arsc        (UTF-16LE)
+    All other files carried byte-for-byte with original compression type.
     """
     tmp_apk = OUTPUT_APK + ".tmp"
 
@@ -197,16 +217,15 @@ def binary_patch_apk(old_pkg, new_pkg):
                 if item.filename == 'AndroidManifest.xml':
                     data = patch_manifest(data, old_pkg, new_pkg)
 
-                elif item.filename == 'classes.dex':
+                elif item.filename.startswith('classes') and item.filename.endswith('.dex'):
                     data = patch_dex(data, old_pkg, new_pkg)
 
-                elif item.filename.startswith('classes') and item.filename.endswith('.dex'):
-                    # Multi-dex: patch all DEX files
-                    data = patch_dex(data, old_pkg, new_pkg)
+                elif item.filename == 'resources.arsc':
+                    data = patch_arsc(data, old_pkg, new_pkg)
 
                 zout.writestr(item, data, compress_type=item.compress_type)
 
-    print(f"[OK] APK repacked")
+    print(f"[OK] APK repacked — manifest + dex + arsc all patched")
     return tmp_apk
 
 
@@ -241,6 +260,21 @@ def verify():
         print("[WARN] Signature verify failed")
 
 
+def verify_no_old_pkg(old_pkg):
+    """Final sanity check — scan every file in output APK for old package name."""
+    old_utf8  = old_pkg.encode('utf-8')
+    old_utf16 = old_pkg.encode('utf-16-le')
+    found = []
+    with zipfile.ZipFile(OUTPUT_APK) as z:
+        for item in z.infolist():
+            data = z.read(item.filename)
+            if old_utf8 in data or old_utf16 in data:
+                found.append(item.filename)
+    if found:
+        raise RuntimeError(f"Old package still present in: {found}")
+    print(f"[OK] Full scan clean — old package name gone from all files")
+
+
 if __name__ == "__main__":
     try:
         print("\n=== Step 1: Keystore ===")
@@ -252,7 +286,7 @@ if __name__ == "__main__":
         print("\n=== Step 3: Generate Same-Length New Package Name ===")
         new_pkg = same_length_random_package(old_pkg)
 
-        print("\n=== Step 4: Binary Patch APK (Manifest + DEX) ===")
+        print("\n=== Step 4: Binary Patch APK (Manifest + DEX + ARSC) ===")
         tmp_apk = binary_patch_apk(old_pkg, new_pkg)
 
         print("\n=== Step 5: Align ===")
@@ -261,8 +295,11 @@ if __name__ == "__main__":
         print("\n=== Step 6: Sign ===")
         sign(aligned_apk)
 
-        print("\n=== Step 7: Verify ===")
+        print("\n=== Step 7: Verify Signature ===")
         verify()
+
+        print("\n=== Step 8: Full Scan — No Old Package Remaining ===")
+        verify_no_old_pkg(old_pkg)
 
         print(f"\n[DONE] Package: {old_pkg} → {new_pkg}")
         print(f"[DONE] Install and open: {OUTPUT_APK}")
