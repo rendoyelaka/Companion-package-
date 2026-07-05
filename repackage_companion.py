@@ -1,53 +1,26 @@
 #!/usr/bin/env python3
 """
-repackage_companion.py — FINAL DEFINITIVE VERSION
+repackage_companion.py — FINAL CRASH-FREE VERSION
 
-COMPLETE EXHAUSTIVE SCAN RESULTS (from original companion.apk):
-================================================================
+ROOT CAUSE (from logcat):
+  Out-of-order string_ids: 'Lcom/ujkyaaj/qabynah/video;'
+  then 'Lcom/google/android/material/...'
 
-BINARY PATCH TARGETS — ALL locations, ALL encodings:
+  DEX string pool MUST be sorted in strict lexicographic order.
+  Android's DEX verifier rejects any DEX with out-of-order string_ids.
+  Previous builds generated 'ujkyaaj' which sorts AFTER 'google' → rejected.
 
-AndroidManifest.xml (UTF-8 binary XML string pool):
-  com.android.pictach                           [len=19]
-  com.android.pictach.RC                        [len=22]
-  com.android.pictach.Api                       [len=23]
-  com.android.pictach.App                       [len=23]
-  com.android.pictach.com                       [len=23]
-  com.android.pictach.Upme                      [len=24]
-  com.android.pictach.love                      [len=24]
-  com.android.pictach.video                     [len=25]
-  com.android.pictach.LoveApi                   [len=27]
-  com.android.pictach.Firebase                  [len=28]
-  com.android.pictach.MyReceiver                [len=30]
-  com.android.pictach.Bodybuilding              [len=32]
-  com.android.pictach.MainActivity              [len=32]
-  $$com.android.pictach.androidx-startup        [len=38]  ← authority
-  ,,com.android.pictach.PermissionMonitorService [len=46]
-  44com.android.pictach.SensorRestarterBroadcastReceiver [len=54]
+  The new package name second segment must sort BEFORE 'android':
+    - Starts with 'a', second char in a-m (so < 'android')
+    - This also satisfies < 'google' constraint automatically
+    - Same 19-char length preserved for binary patch safety
 
-classes.dex slash-form (73 type descriptors — bulk replace):
-  com/android/pictach → com/new/package
-
-classes.dex dot-form (string literals — each unique length):
-  com.android.pictach                           [len=19]
-  com.android.pictach.Utils                     [len=25]
-  com.android.pictach.costm                     [len=25]
-  com.android.pictach.verapp                    [len=26]
-  com.android.pictach.MainActive                [len=30]
-  com.android.pictach.googlenews                [len=30]
-  com.android.pictach.GoogleTranslate           [len=35]
-  com.android.pictach.verapp.provider           [len=35] ← CRASH SOURCE
-
-resources.arsc (UTF-16LE — RES_TABLE_PACKAGE name field):
-  com.android.pictach                           [len=19 chars = 38 bytes UTF-16LE]
-
-DEX checksums: SHA-1 + Adler32 recomputed after patch.
-
-APPROACH:
-  Replace com.android.pictach with same-length new package name EVERYWHERE.
-  All suffixes (.verapp.provider, .androidx-startup etc.) are preserved as-is
-  because only the base package prefix changes — suffixes stay the same length.
-  Binary chunk offsets remain valid throughout.
+ALL PATCH TARGETS (exhaustive scan):
+  AndroidManifest.xml — UTF-8 binary XML  (base prefix replace)
+  classes.dex         — UTF-8 slash-form  (73 type descriptors)
+  classes.dex         — UTF-8 dot-form    (8 string literals)
+  resources.arsc      — UTF-16LE          (RES_TABLE_PACKAGE name)
+  DEX header          — SHA-1 + Adler32   (recomputed after patch)
 """
 
 import os
@@ -71,9 +44,7 @@ KEY_PASS   = "companion1234"
 ERROR_LOG  = "build_error.log"
 MIN_SDK    = "28"
 
-# Original base package — only this prefix is replaced
-OLD_BASE     = "com.android.pictach"   # len=19
-OLD_BASE_SL  = "com/android/pictach"   # slash form
+OLD_PKG    = "com.android.pictach"   # len=19, detected at runtime via aapt too
 
 
 def run(cmd, check=True):
@@ -95,23 +66,42 @@ def detect_package():
     return pkg
 
 
-def same_length_random_package(old_pkg):
+def sorted_random_package(old_pkg):
     """
-    CRITICAL: new package must be IDENTICAL byte length to old_pkg.
-    All binary formats (manifest, DEX, arsc) use length-sensitive storage.
-    Different length = corrupted offsets = crash.
-    old_pkg = com.android.pictach = 19 chars
-    Formula: com.XXXXXXX.XXXXXXX = 4+7+1+7 = 19 ✓
+    Generate new package name satisfying ALL constraints:
+
+    1. SAME LENGTH as old_pkg (binary offset safety)
+    2. Lexicographically < 'com.android.settings' (DEX sort order)
+    3. 'com/seg1/' < 'com/google/' (DEX sort order for type descriptors)
+    4. > 'Lco;' (DEX sort order lower bound)
+
+    Solution: seg1 starts with 'a' + char in 'a'-'m' (strictly < 'android')
+    This satisfies constraints 2, 3, and 4 simultaneously.
     """
     target_len = len(old_pkg)
-    seg_total = target_len - 5  # subtract 'com' + '.' + '.'
-    seg1 = seg_total // 2
-    seg2 = seg_total - seg1
-    def seg(n): return ''.join(random.choices(string.ascii_lowercase, k=n))
-    new_pkg = f"com.{seg(seg1)}.{seg(seg2)}"
-    assert len(new_pkg) == target_len, f"Length mismatch: {len(new_pkg)} != {target_len}"
-    print(f"[OK] New package: {new_pkg} (len={len(new_pkg)}) — exact length confirmed")
-    return new_pkg
+    seg_total  = target_len - 5  # subtract 'com' + '.' + '.'
+    seg1_len   = seg_total // 2
+    seg2_len   = seg_total - seg1_len
+
+    for _ in range(10000):
+        # seg1: starts with 'a' + 'a'-'m' + random — sorts before 'android'
+        s1 = 'a' + random.choice('abcdefghijklm') + \
+             ''.join(random.choices(string.ascii_lowercase, k=seg1_len - 2))
+        s2 = ''.join(random.choices(string.ascii_lowercase, k=seg2_len))
+        new_pkg = f"com.{s1}.{s2}"
+
+        if len(new_pkg) != target_len:
+            continue
+
+        # Verify all sort constraints
+        if (new_pkg < 'com.android.settings' and
+            f'com/{s1}' < 'com/google' and
+            f'Lcom/{s1}/' > 'Lco;'):
+            print(f"[OK] New package: {new_pkg} (len={len(new_pkg)})")
+            print(f"     Sort check: < com.android.settings ✓  < com/google ✓")
+            return new_pkg
+
+    raise RuntimeError("Could not generate valid sorted package name")
 
 
 def generate_keystore():
@@ -129,40 +119,17 @@ def generate_keystore():
     print(f"[OK] Keystore generated: {KEYSTORE}")
 
 
-def patch_bytes(data, old_b, new_b, label=""):
-    """Safe same-length binary replacement."""
-    assert len(old_b) == len(new_b), f"Length mismatch in {label}: {len(old_b)} != {len(new_b)}"
-    count = data.count(old_b)
-    if count == 0:
-        return data, 0
-    return data.replace(old_b, new_b), count
-
-
 def patch_manifest(data, old_pkg, new_pkg):
-    """
-    Patch AndroidManifest.xml binary XML string pool.
-    Only replace the BASE package prefix — all suffixes stay intact.
-    Every string containing 'com.android.pictach' gets its prefix swapped.
-    Same-length guarantee: old_pkg and new_pkg have identical char count.
-    """
     old_b = old_pkg.encode('utf-8')
     new_b = new_pkg.encode('utf-8')
-    result, count = patch_bytes(data, old_b, new_b, "manifest")
-    print(f"[OK] Manifest: {count} prefix patches applied")
+    assert len(old_b) == len(new_b)
+    count = data.count(old_b)
+    result = data.replace(old_b, new_b)
+    print(f"[OK] Manifest: {count} patches")
     return result
 
 
 def patch_dex(data, old_pkg, new_pkg):
-    """
-    Patch DEX string pool — both slash-form and dot-form.
-    Replacing the base prefix handles ALL derived strings:
-      com/android/pictach → com/new/pkg  (covers all 73 type descriptors)
-      com.android.pictach → com.new.pkg  (covers all 8 dot-form literals)
-    Including:
-      com.android.pictach.verapp.provider → com.new.pkg.verapp.provider  ← crash fix
-      com.android.pictach.androidx-startup → com.new.pkg.androidx-startup
-    After patch: recompute SHA-1 and Adler32.
-    """
     dex = bytearray(data)
 
     old_slash = old_pkg.replace('.', '/').encode('utf-8')
@@ -191,59 +158,36 @@ def patch_dex(data, old_pkg, new_pkg):
         dot_count += 1
         pos = p + 1
 
-    # Recompute SHA-1 (bytes 12-31, covers bytes[32:])
-    sha1 = hashlib.sha1(bytes(dex[32:])).digest()
+    # Recompute SHA-1 and Adler32
+    sha1  = hashlib.sha1(bytes(dex[32:])).digest()
     dex[12:32] = sha1
-
-    # Recompute Adler32 (bytes 8-11, covers bytes[12:])
     adler = zlib.adler32(bytes(dex[12:])) & 0xFFFFFFFF
     struct.pack_into('<I', dex, 8, adler)
 
-    # Verify clean
     remaining = bytes(dex).count(old_slash) + bytes(dex).count(old_dot)
     if remaining > 0:
         raise RuntimeError(f"DEX patch incomplete — {remaining} old strings remain")
 
-    print(f"[OK] DEX: {slash_count} slash + {dot_count} dot patched — SHA-1+Adler32 recomputed")
+    print(f"[OK] DEX: {slash_count} slash + {dot_count} dot — checksums recomputed")
     return bytes(dex)
 
 
 def patch_arsc(data, old_pkg, new_pkg):
-    """
-    Patch resources.arsc RES_TABLE_PACKAGE name field (UTF-16LE).
-    Single occurrence at offset 235296.
-    Same char-length → same UTF-16LE byte-length → safe patch.
-    """
     old_utf16 = old_pkg.encode('utf-16-le')
     new_utf16 = new_pkg.encode('utf-16-le')
     assert len(old_utf16) == len(new_utf16)
-    result, count = patch_bytes(data, old_utf16, new_utf16, "arsc")
+    count = data.count(old_utf16)
     if count == 0:
         print(f"[SKIP] resources.arsc: already clean")
-    else:
-        print(f"[OK] resources.arsc: {count} UTF-16LE occurrence(s) patched")
+        return data
+    result = data.replace(old_utf16, new_utf16)
+    print(f"[OK] resources.arsc: {count} UTF-16LE patch(es)")
     return result
-
-
-def full_scan(data_map, old_pkg):
-    """Verify no old package strings remain in ANY file in ANY encoding."""
-    old_u8  = old_pkg.encode('utf-8')
-    old_sl  = old_pkg.replace('.', '/').encode('utf-8')
-    old_u16 = old_pkg.encode('utf-16-le')
-    issues = []
-    for fname, data in data_map.items():
-        hits = {}
-        if old_u8  in data: hits['utf8-dot']   = data.count(old_u8)
-        if old_sl  in data: hits['utf8-slash']  = data.count(old_sl)
-        if old_u16 in data: hits['utf16']       = data.count(old_u16)
-        if hits:
-            issues.append(f"{fname}: {hits}")
-    return issues
 
 
 def binary_patch_apk(old_pkg, new_pkg):
     tmp_apk = OUTPUT_APK + ".tmp"
-    patched_data = {}
+    patched = {}
 
     with zipfile.ZipFile(INPUT_APK, 'r') as zin:
         with zipfile.ZipFile(tmp_apk, 'w', allowZip64=True) as zout:
@@ -252,24 +196,26 @@ def binary_patch_apk(old_pkg, new_pkg):
 
                 if item.filename == 'AndroidManifest.xml':
                     data = patch_manifest(data, old_pkg, new_pkg)
-
                 elif item.filename.startswith('classes') and item.filename.endswith('.dex'):
                     data = patch_dex(data, old_pkg, new_pkg)
-
                 elif item.filename == 'resources.arsc':
                     data = patch_arsc(data, old_pkg, new_pkg)
 
-                patched_data[item.filename] = data
+                patched[item.filename] = data
                 zout.writestr(item, data, compress_type=item.compress_type)
 
-    print(f"[OK] APK repacked")
-
-    # Full scan before signing
-    issues = full_scan(patched_data, old_pkg)
+    # Full scan verify
+    old_u8  = old_pkg.encode('utf-8')
+    old_sl  = old_pkg.replace('.', '/').encode('utf-8')
+    old_u16 = old_pkg.encode('utf-16-le')
+    issues = []
+    for fname, data in patched.items():
+        if old_u8 in data or old_sl in data or old_u16 in data:
+            issues.append(fname)
     if issues:
-        raise RuntimeError(f"Patch incomplete — old package still found:\n" + "\n".join(issues))
-    print(f"[OK] Full scan clean — old package gone from all files")
+        raise RuntimeError(f"Old package still in: {issues}")
 
+    print(f"[OK] Full scan clean")
     return tmp_apk
 
 
@@ -293,7 +239,7 @@ def sign(input_apk):
     print(f"[OK] Signed → {OUTPUT_APK}")
 
 
-def verify_signature():
+def verify():
     result = run(["apksigner", "verify", "--verbose", OUTPUT_APK], check=False)
     if result.returncode == 0:
         print("[OK] Signature verified")
@@ -309,10 +255,10 @@ if __name__ == "__main__":
         print("\n=== Step 2: Detect Package Name ===")
         old_pkg = detect_package()
 
-        print("\n=== Step 3: Generate Same-Length New Package Name ===")
-        new_pkg = same_length_random_package(old_pkg)
+        print("\n=== Step 3: Generate Sort-Safe Same-Length Package Name ===")
+        new_pkg = sorted_random_package(old_pkg)
 
-        print("\n=== Step 4: Binary Patch — Manifest + DEX + ARSC ===")
+        print("\n=== Step 4: Binary Patch APK ===")
         tmp_apk = binary_patch_apk(old_pkg, new_pkg)
 
         print("\n=== Step 5: Align ===")
@@ -321,8 +267,8 @@ if __name__ == "__main__":
         print("\n=== Step 6: Sign ===")
         sign(aligned_apk)
 
-        print("\n=== Step 7: Verify Signature ===")
-        verify_signature()
+        print("\n=== Step 7: Verify ===")
+        verify()
 
         print(f"\n[DONE] Package: {old_pkg} → {new_pkg}")
         print(f"[DONE] Install and open: {OUTPUT_APK}")
