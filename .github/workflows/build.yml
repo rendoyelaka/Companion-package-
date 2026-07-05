@@ -34,7 +34,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: companion-repackaged
+          name: companion-repackaged-${{ github.run_number }}
           path: companion_repackaged.apk
           retention-days: 7
           overwrite: true
@@ -43,7 +43,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-error-log
+          name: build-error-log-${{ github.run_number }}
           path: build_error.log
           retention-days: 7
           overwrite: true
